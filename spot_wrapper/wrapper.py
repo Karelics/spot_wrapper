@@ -2,8 +2,14 @@ import logging
 import time
 import traceback
 import typing
+import os
 
+from google.protobuf import wrappers_pb2 as wrappers
+
+from bosdyn.bddf import bosdyn
 import bosdyn.client.auth
+from bosdyn.client.map_processing import MapProcessingServiceClient
+from bosdyn.client.recording import GraphNavRecordingServiceClient
 from bosdyn.api import (
     arm_surface_contact_pb2,
     arm_surface_contact_service_pb2,
@@ -16,6 +22,8 @@ from bosdyn.api import (
     robot_state_pb2,
     world_object_pb2,
 )
+from bosdyn.api.graph_nav import graph_nav_pb2, recording_pb2, map_processing_pb2
+
 from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
 from bosdyn.api.spot.choreography_sequence_pb2 import (
     Animation,
@@ -60,7 +68,7 @@ from bosdyn.client.time_sync import TimeSyncEndpoint
 from bosdyn.client.world_object import WorldObjectClient
 from bosdyn.geometry import EulerZXY
 from bosdyn.mission.client import MissionClient
-from bosdyn.util import now_sec
+from bosdyn.client.recording import NotReadyYetError
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from .spot_arm import SpotArm
@@ -74,6 +82,10 @@ from .spot_leash import SpotLeash, SpotLeashProtocol
 from .spot_mission_wrapper import SpotMission
 from .spot_world_objects import SpotWorldObjects
 from .wrapper_helpers import RobotCommandData, RobotState
+
+from threading import Lock
+
+from typing import Optional
 
 SPOT_CLIENT_NAME = "ros_spot"
 MAX_COMMAND_DURATION = 1e5
@@ -419,6 +431,8 @@ class SpotWrapper:
         self._trajectory_status_unknown = False
         self._command_data = RobotCommandData()
 
+        self._movement_lock = Lock()
+
         try:
             self._sdk = create_standard_sdk(
                 SPOT_CLIENT_NAME, service_clients=[MissionClient], cert_resource_glob=cert_resource_glob
@@ -467,6 +481,12 @@ class SpotWrapper:
                 self._spot_check_client = self._robot.ensure_client(SpotCheckClient.default_service_name)
                 self._mission_client = self._robot.ensure_client(MissionClient.default_service_name)
                 self._license_client = self._robot.ensure_client(LicenseClient.default_service_name)
+
+                # Graph nav clients
+                self._recording_client = self._robot.ensure_client(GraphNavRecordingServiceClient.default_service_name)
+                self._graph_nav_client = self._robot.ensure_client(GraphNavClient.default_service_name)
+                self._map_processing_client = self._robot.ensure_client(MapProcessingServiceClient.default_service_name)
+
                 if not self.gripperless and self._robot.has_arm():
                     self._gripper_cam_param_client = self._robot.ensure_client(
                         GripperCameraParamClient.default_service_name
@@ -692,7 +712,7 @@ class SpotWrapper:
                 authenticated = True
             except RpcError as err:
                 sleep_secs = 15
-                logger.warn(
+                logger.warning(
                     "Failed to communicate with robot: {}\nEnsure the robot is powered on and you can "
                     "ping {}. Robot may still be booting. Will retry in {} seconds".format(
                         err, robot.address, sleep_secs
@@ -960,6 +980,100 @@ class SpotWrapper:
             google.protobuf.Timestamp
         """
         return robotToLocalTime(timestamp, self._robot)
+
+    def create_waypoint(self, waypoint_name="default") -> recording_pb2.CreateWaypointResponse:
+        """
+        Create a waypoint with the waypoint name
+        """
+        return self._recording_client.create_waypoint(waypoint_name=waypoint_name)
+
+    def start_recording(self) -> recording_pb2.StartRecordingResponse:
+        """Start recording a map."""
+        return self._recording_client.start_recording()
+
+    def can_start_recording(self) -> bool:
+        """
+        Check start recording
+        """
+        # Before starting to record, check the state of the GraphNav system.
+        graph = self._graph_nav_client.download_graph()
+        if graph is not None:
+            # Check that the graph has waypoints. If it does, then we need to be localized to the graph
+            # before starting to record
+            if len(graph.waypoints) > 0:
+                localization_state = self._graph_nav_client.get_localization_state()
+                if not localization_state.localization.waypoint_id:
+                    # Not localized to anything in the map. The best option is to clear the graph or
+                    # attempt to localize to the current map.
+                    # Returning false since the GraphNav system is not in the state it should be to
+                    # begin recording.
+                    return False
+        # If there is no graph or there exists a graph that we are localized to, then it is fine to
+        # start recording, so we return True.
+        return True
+
+    def stop_recording(self, retry: bool = True) -> bool:
+        """
+        Stop the recording service.
+
+        Returns:  a bool indicating if the recording has stopped.
+        """
+        # TODO: cleanup after testing on real robot.
+        first_iter = True
+        while True:
+            try:
+                self._recording_client.stop_recording()
+                return True
+            except NotReadyYetError as err:
+                # It is possible that we are not finished recording yet due to
+                # background processing. Try again every 1 second.
+                if first_iter:
+                    print("Cleaning up recording...")
+                first_iter = False
+                time.sleep(1.0)
+            except Exception as err:
+                print("Stop recording failed: " + str(err))
+                break
+
+            if not retry:
+                return False
+
+    def auto_close_loops(self,
+                         close_fiducial_loops: bool,
+                         close_odometry_loops: bool) -> map_processing_pb2.ProcessTopologyResponse:
+        """
+        Automatically find and close all loops in the graph.
+        """
+        response = self._map_processing_client.process_topology(
+            params=map_processing_pb2.ProcessTopologyRequest.Params(
+                do_fiducial_loop_closure=wrappers.BoolValue(value=close_fiducial_loops),
+                do_odometry_loop_closure=wrappers.BoolValue(value=close_odometry_loops)),
+            modify_map_on_server=True)
+        print("Created {} new edge(s).".format(len(response.new_subgraph.edges)))
+        return response
+
+    def optimize_anchoring(self) -> map_processing_pb2.ProcessAnchoringResponse:
+        """
+        Call anchoring optimization on the server.
+
+        producing a globally optimal reference frame for waypoints to be expressed in.
+        """
+        tries = 1
+        while tries < 5:
+            try:
+                response = self._map_processing_client.process_anchoring(
+                    params=map_processing_pb2.ProcessAnchoringRequest.Params(),
+                    modify_anchoring_on_server=True, stream_intermediate_results=False)
+                if response.status == map_processing_pb2.ProcessAnchoringResponse.STATUS_OK:
+                    print("Optimized anchoring after {} iteration(s).".format(response.iteration))
+                else:
+                    print("Error optimizing  uploading {}".format(response))
+                return response
+            except Exception as e:
+                tries+=1
+                print("Optimizing map failed, this removes the current map. retrying...")
+                time.sleep(1)
+        return None
 
     def claim(self) -> typing.Tuple[bool, str]:
         """Get a lease for the robot, a handle on the estop endpoint, and the ID of the robot."""
@@ -1312,16 +1426,27 @@ class SpotWrapper:
         Returns:
             Tuple of bool success and a string message
         """
-        start_time = now_sec() if timestamp is None else timestamp
-        end_time = start_time + cmd_duration
-        if body_height:
-            current_mobility_params = self.get_mobility_params()
-            height_adjusted_params = RobotCommandBuilder.mobility_params(
-                body_height=body_height,
-                locomotion_hint=current_mobility_params.locomotion_hint,
-                stair_hint=current_mobility_params.stair_hint,
-                external_force_params=current_mobility_params.external_force_params,
-                stairs_mode=current_mobility_params.stairs_mode,
+
+        if self._movement_lock.locked():
+            # Ignore incoming cmd vel commands if other action is controlling the robot.
+            return False, "Movement is locked"
+
+        with self._movement_lock:
+            end_time = time.time() + cmd_duration
+            if body_height:
+                current_mobility_params = self.get_mobility_params()
+                height_adjusted_params = RobotCommandBuilder.mobility_params(
+                    body_height=body_height,
+                    locomotion_hint=current_mobility_params.locomotion_hint,
+                    stair_hint=current_mobility_params.stair_hint,
+                    external_force_params=current_mobility_params.external_force_params,
+                    stairs_mode=current_mobility_params.stairs_mode,
+                )
+                self.set_mobility_params(height_adjusted_params)
+            response = self._robot_command(
+                RobotCommandBuilder.synchro_velocity_command(v_x=v_x, v_y=v_y, v_rot=v_rot, params=self._mobility_params),
+                end_time_secs=end_time,
+                timesync_endpoint=self._robot.time_sync.endpoint,
             )
             if use_obstacle_params:
                 height_adjusted_params.obstacle_params.CopyFrom(current_mobility_params.obstacle_params)
@@ -1384,63 +1509,64 @@ class SpotWrapper:
         Returns:
             (bool, str) tuple indicating whether the command was successfully sent, and a message
         """
-        if mobility_params is None:
-            mobility_params = self._mobility_params
-        if disable_vision_body_obstacle_avoidance:
-            self._logger.warning("Caution: attempting to send mobility trajectory without obstacle avoidance")
-            mobility_params.obstacle_params.disable_vision_body_obstacle_avoidance = (
-                disable_vision_body_obstacle_avoidance
-            )
+        with self._movement_lock:
+            if mobility_params is None:
+                mobility_params = self._mobility_params
+            if disable_vision_body_obstacle_avoidance:
+                self._logger.warning("Caution: attempting to send mobility trajectory without obstacle avoidance")
+                mobility_params.obstacle_params.disable_vision_body_obstacle_avoidance = (
+                    disable_vision_body_obstacle_avoidance
+                )
 
-        self._trajectory_status_unknown = False
-        self.trajectory_complete = False
-        self.stopped = False
-        self.at_goal = False
-        self.is_stopping = False
-        self.last_trajectory_command_precise = precise_position
-        self._logger.info("got command duration of {}".format(cmd_duration))
-        end_time = now_sec() + cmd_duration
-        if frame_name == "vision":
-            vision_tform_body = frame_helpers.get_vision_tform_body(
-                self._robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
-            )
-            body_tform_goal = math_helpers.SE3Pose(
-                x=goal_x, y=goal_y, z=0, rot=math_helpers.Quat.from_yaw(goal_heading)
-            )
-            vision_tform_goal = vision_tform_body * body_tform_goal
-            response = self._robot_command(
-                RobotCommandBuilder.synchro_se2_trajectory_point_command(
-                    goal_x=vision_tform_goal.x,
-                    goal_y=vision_tform_goal.y,
-                    goal_heading=vision_tform_goal.rot.to_yaw(),
-                    frame_name=frame_helpers.VISION_FRAME_NAME,
-                    params=mobility_params,
-                ),
-                end_time_secs=end_time,
-            )
-        elif frame_name == "odom":
-            odom_tform_body = frame_helpers.get_odom_tform_body(
-                self._robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
-            )
-            body_tform_goal = math_helpers.SE3Pose(
-                x=goal_x, y=goal_y, z=0, rot=math_helpers.Quat.from_yaw(goal_heading)
-            )
-            odom_tform_goal = odom_tform_body * body_tform_goal
-            response = self._robot_command(
-                RobotCommandBuilder.synchro_se2_trajectory_point_command(
-                    goal_x=odom_tform_goal.x,
-                    goal_y=odom_tform_goal.y,
-                    goal_heading=odom_tform_goal.rot.to_yaw(),
-                    frame_name=frame_helpers.ODOM_FRAME_NAME,
-                    params=mobility_params,
-                ),
-                end_time_secs=end_time,
-            )
-        else:
-            raise ValueError("frame_name must be 'vision' or 'odom'")
-        if response[0]:
-            self.last_trajectory_command = response[2]
-        return response[0], response[1]
+            self._trajectory_status_unknown = False
+            self.trajectory_complete = False
+            self.stopped = False
+            self.at_goal = False
+            self.is_stopping = False
+            self.last_trajectory_command_precise = precise_position
+            self._logger.info("got command duration of {}".format(cmd_duration))
+            end_time = time.time() + cmd_duration
+            if frame_name == "vision":
+                vision_tform_body = frame_helpers.get_vision_tform_body(
+                    self._robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
+                )
+                body_tform_goal = math_helpers.SE3Pose(
+                    x=goal_x, y=goal_y, z=0, rot=math_helpers.Quat.from_yaw(goal_heading)
+                )
+                vision_tform_goal = vision_tform_body * body_tform_goal
+                response = self._robot_command(
+                    RobotCommandBuilder.synchro_se2_trajectory_point_command(
+                        goal_x=vision_tform_goal.x,
+                        goal_y=vision_tform_goal.y,
+                        goal_heading=vision_tform_goal.rot.to_yaw(),
+                        frame_name=frame_helpers.VISION_FRAME_NAME,
+                        params=mobility_params,
+                    ),
+                    end_time_secs=end_time,
+                )
+            elif frame_name == "odom":
+                odom_tform_body = frame_helpers.get_odom_tform_body(
+                    self._robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
+                )
+                body_tform_goal = math_helpers.SE3Pose(
+                    x=goal_x, y=goal_y, z=0, rot=math_helpers.Quat.from_yaw(goal_heading)
+                )
+                odom_tform_goal = odom_tform_body * body_tform_goal
+                response = self._robot_command(
+                    RobotCommandBuilder.synchro_se2_trajectory_point_command(
+                        goal_x=odom_tform_goal.x,
+                        goal_y=odom_tform_goal.y,
+                        goal_heading=odom_tform_goal.rot.to_yaw(),
+                        frame_name=frame_helpers.ODOM_FRAME_NAME,
+                        params=mobility_params,
+                    ),
+                    end_time_secs=end_time,
+                )
+            else:
+                raise ValueError("frame_name must be 'vision' or 'odom'")
+            if response[0]:
+                self.last_trajectory_command = response[2]
+            return response[0], response[1]
 
     def robot_command(
         self, robot_command: robot_command_pb2.RobotCommand, duration: float = MAX_COMMAND_DURATION
@@ -1585,6 +1711,71 @@ class SpotWrapper:
             return self._spot_dance.list_all_dances()
         else:
             return False, "Spot is not licensed for choreography", []
+
+    def _write_full_graph(self, graph, download_path):
+        """Download the graph from robot to the specified, local filepath location."""
+        graph_bytes = graph.SerializeToString()
+        self._write_bytes(download_path, '/graph', graph_bytes)
+
+    def _write_bytes(self, filepath, filename, data):
+        """Write data to a file."""
+        os.makedirs(filepath, exist_ok=True)
+        with open(filepath + filename, 'wb+') as f:
+            f.write(data)
+            f.close()
+
+    def download_full_graph(self, download_path: str) -> bool:
+        """Download the graph and snapshots from the robot."""
+        graph = self._graph_nav_client.download_graph()
+        if graph is None:
+            print("Failed to download the graph.")
+            return False
+        self._write_full_graph(graph, download_path=download_path)
+        print("Graph downloaded with {} waypoints and {} edges".format(
+            len(graph.waypoints), len(graph.edges)))
+        # Download the waypoint and edge snapshots.
+        self._download_and_write_waypoint_snapshots(graph.waypoints, download_path=download_path)
+        self._download_and_write_edge_snapshots(graph.edges, download_path=download_path)
+        return True
+
+    def _download_and_write_waypoint_snapshots(self, waypoints, download_path):
+        """Download the waypoint snapshots from robot to the specified, local filepath location."""
+        num_waypoint_snapshots_downloaded = 0
+        for waypoint in waypoints:
+            if len(waypoint.snapshot_id) == 0:
+                continue
+            try:
+                waypoint_snapshot = self._graph_nav_client.download_waypoint_snapshot(
+                    waypoint.snapshot_id)
+            except Exception:
+                # Failure in downloading waypoint snapshot. Continue to next snapshot.
+                print("Failed to download waypoint snapshot: " + waypoint.snapshot_id)
+                continue
+            self._write_bytes(download_path + '/waypoint_snapshots',
+                              '/' + waypoint.snapshot_id, waypoint_snapshot.SerializeToString())
+            num_waypoint_snapshots_downloaded += 1
+            print("Downloaded {} of the total {} waypoint snapshots.".format(
+                num_waypoint_snapshots_downloaded, len(waypoints)))
+
+    def _download_and_write_edge_snapshots(self, edges, download_path):
+        """Download the edge snapshots from robot to the specified, local filepath location."""
+        num_edge_snapshots_downloaded = 0
+        num_to_download = 0
+        for edge in edges:
+            if len(edge.snapshot_id) == 0:
+                continue
+            num_to_download += 1
+            try:
+                edge_snapshot = self._graph_nav_client.download_edge_snapshot(edge.snapshot_id)
+            except Exception:
+                # Failure in downloading edge snapshot. Continue to next snapshot.
+                print("Failed to download edge snapshot: " + edge.snapshot_id)
+                continue
+            self._write_bytes(download_path + '/edge_snapshots', '/' + edge.snapshot_id,
+                              edge_snapshot.SerializeToString())
+            num_edge_snapshots_downloaded += 1
+            print("Downloaded {} of the total {} edge snapshots.".format(
+                num_edge_snapshots_downloaded, num_to_download))
 
     def get_choreography_status(
         self,

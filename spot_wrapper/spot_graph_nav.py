@@ -296,6 +296,7 @@ class SpotGraphNav:
         self._graph_nav_client.set_localization(
             initial_guess_localization=localization,
             # It's hard to get the pose perfect, search +/-20 deg and +/-20cm (0.2m).
+            do_ambiguity_check=True,
             max_distance=0.2,
             max_yaw=20.0 * math.pi / 180.0,
             fiducial_init=graph_nav_pb2.SetLocalizationRequest.FIDUCIAL_INIT_NO_FIDUCIAL,
@@ -495,7 +496,7 @@ class SpotGraphNav:
                 "fiducial before attempting a navigation command."
             )
 
-    def _navigate_to(self, waypoint_id: str) -> typing.Tuple[bool, str]:
+    def _navigate_to(self, waypoint_id: str, goal_handle = None) -> typing.Tuple[bool, str]:
         """Navigate to a specific waypoint."""
         destination_waypoint = self._find_unique_waypoint_id(
             waypoint_id,
@@ -524,6 +525,17 @@ class SpotGraphNav:
             time.sleep(0.5)  # Sleep for half a second to allow for command execution.
             # Poll the robot for feedback to determine if the navigation command is complete.
             is_finished = self._check_success(nav_to_cmd_id)
+
+            status = self._graph_nav_client.navigation_feedback(nav_to_cmd_id)
+            self._logger.info(f"Navigating to {destination_waypoint} Status: {status}")
+
+            if goal_handle.is_cancel_requested:
+                self._logger.info("Cancel requested - canceling navigation")
+                break
+
+            if not goal_handle.is_active:
+                self._logger.info("Aborted - canceling navigation")
+                break
 
         self._lease = self._lease_wallet.advance()
 
