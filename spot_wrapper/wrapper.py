@@ -1442,15 +1442,9 @@ class SpotWrapper:
                     external_force_params=current_mobility_params.external_force_params,
                     stairs_mode=current_mobility_params.stairs_mode,
                 )
+                if use_obstacle_params:
+                    height_adjusted_params.obstacle_params.CopyFrom(current_mobility_params.obstacle_params)
                 self.set_mobility_params(height_adjusted_params)
-            response = self._robot_command(
-                RobotCommandBuilder.synchro_velocity_command(v_x=v_x, v_y=v_y, v_rot=v_rot, params=self._mobility_params),
-                end_time_secs=end_time,
-                timesync_endpoint=self._robot.time_sync.endpoint,
-            )
-            if use_obstacle_params:
-                height_adjusted_params.obstacle_params.CopyFrom(current_mobility_params.obstacle_params)
-            self.set_mobility_params(height_adjusted_params)
         response = self._robot_command(
             RobotCommandBuilder.synchro_velocity_command(v_x=v_x, v_y=v_y, v_rot=v_rot, params=self._mobility_params),
             end_time_secs=end_time,
