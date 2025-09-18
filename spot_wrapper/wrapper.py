@@ -70,6 +70,7 @@ from bosdyn.geometry import EulerZXY
 from bosdyn.mission.client import MissionClient
 from bosdyn.util import now_sec
 from bosdyn.client.recording import NotReadyYetError
+from bosdyn.util import now_sec
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from .spot_arm import SpotArm
@@ -1444,6 +1445,9 @@ class SpotWrapper:
         )
         self.last_velocity_command_time = end_time
         return response[0], response[1]
+
+    def clear_graph(self) -> typing.Tuple[bool, str]:
+        return self._spot_graph_nav.clear_graph()
 
     def arm_joint_cmd(
         self, *, sh0: float, sh1: float, el0: float, el1: float, wr0: float, wr1: float
