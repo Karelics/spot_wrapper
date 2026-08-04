@@ -1107,6 +1107,7 @@ class SpotWrapper:
             self._async_tasks.update()
         except Exception as e:
             self._logger.error(f"Update tasks failed with error: {str(e)}")
+            print(traceback.format_exc())
 
     def resetEStop(self) -> None:
         """Get keepalive for eStop"""
