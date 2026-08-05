@@ -3,6 +3,7 @@ import math
 import os
 import time
 import typing
+import rclpy
 
 from bosdyn.api.graph_nav import graph_nav_pb2, map_pb2, map_processing_pb2, nav_pb2
 from bosdyn.client.frame_helpers import get_odom_tform_body
@@ -511,17 +512,15 @@ class SpotGraphNav:
                 "Failed to find the appropriate unique waypoint id for the navigation command.",
             )
 
-        # Create a new sublease for graphnav.
-        self._lease = self._lease_wallet.advance()
-        sublease = self._lease.create_sublease()
+        self._lease = self._lease_wallet.get_lease()
 
         # Navigate to the destination waypoint.
         is_finished = False
         nav_to_cmd_id = -1
-        while not is_finished:
+        while not is_finished and rclpy.ok():
             # Issue the navigation command about twice a second such that it is easy to terminate the
             # navigation command (with estop or killing the program).
-            nav_to_cmd_id = self._graph_nav_client.navigate_to(destination_waypoint, 1.0, leases=[sublease.lease_proto])
+            nav_to_cmd_id = self._graph_nav_client.navigate_to(destination_waypoint, cmd_duration=1.0, leases=[self._lease.lease_proto])
             time.sleep(0.5)  # Sleep for half a second to allow for command execution.
             # Poll the robot for feedback to determine if the navigation command is complete.
             is_finished = self._check_success(nav_to_cmd_id)
@@ -537,6 +536,7 @@ class SpotGraphNav:
                 self._logger.info("Aborted - canceling navigation")
                 break
 
+        # TODO: Why do we need this advance here?
         self._lease = self._lease_wallet.advance()
 
         status = self._graph_nav_client.navigation_feedback(nav_to_cmd_id)
