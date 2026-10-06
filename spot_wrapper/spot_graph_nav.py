@@ -169,7 +169,7 @@ class SpotGraphNav:
             try:
                 waypoint_snapshot = self._graph_nav_client.download_waypoint_snapshot(waypoint.snapshot_id)
             except Exception:
-                self._logger.warning("Failed to download waypoint snapshot: %s", waypoint.snapshot_id)
+                self._logger.warning(f"Failed to download waypoint snapshot: {waypoint.snapshot_id}")
                 continue
             self._write_bytes_while_download(
                 os.path.join(download_path, "waypoint_snapshots", waypoint.snapshot_id),
@@ -179,7 +179,7 @@ class SpotGraphNav:
             try:
                 edge_snapshot = self._graph_nav_client.download_edge_snapshot(edge.snapshot_id)
             except Exception:
-                self._logger.warning("Failed to download edge snapshot: %s", edge.snapshot_id)
+                self._logger.warning(f"Failed to download edge snapshot: {edge.snapshot_id}")
                 continue
             self._write_bytes_while_download(
                 os.path.join(download_path, "edge_snapshots", edge.snapshot_id),

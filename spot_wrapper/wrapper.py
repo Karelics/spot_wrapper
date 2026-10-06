@@ -220,7 +220,7 @@ class AsyncIdle(AsyncPeriodicQuery):
                     )
                     self._spot_wrapper.last_stand_command = None
             except (ResponseError, RpcError) as e:
-                self._logger.error("Error when getting robot command feedback: %s", e)
+                self._logger.error(f"Error when getting robot command feedback: {e}")
                 self._spot_wrapper.last_stand_command = None
 
         if self._spot_wrapper.last_sit_command is not None:
@@ -244,7 +244,7 @@ class AsyncIdle(AsyncPeriodicQuery):
                     )
                     self._spot_wrapper.last_sit_command = None
             except (ResponseError, RpcError) as e:
-                self._logger.error("Error when getting robot command feedback: %s", e)
+                self._logger.error(f"Error when getting robot command feedback: {e}")
                 self._spot_wrapper.last_sit_command = None
 
         is_moving = False
@@ -304,7 +304,7 @@ class AsyncIdle(AsyncPeriodicQuery):
                     )
                     self._spot_wrapper.last_trajectory_command = None
             except (ResponseError, RpcError) as e:
-                self._logger.error("Error when getting robot command feedback: %s", e)
+                self._logger.error(f"Error when getting robot command feedback: {e}")
                 self._spot_wrapper.last_trajectory_command = None
 
         self._spot_wrapper.is_moving = is_moving
@@ -440,7 +440,7 @@ class SpotWrapper:
                 SPOT_CLIENT_NAME, service_clients=[MissionClient], cert_resource_glob=cert_resource_glob
             )
         except Exception as e:
-            self._logger.error("Error creating SDK object: %s", e)
+            self._logger.error(f"Error creating SDK object: {e}")
             self._valid = False
             return
 
@@ -1095,7 +1095,7 @@ class SpotWrapper:
                 self.resetEStop()
             return True, "Success"
         except (ResponseError, RpcError) as err:
-            self._logger.error("Failed to initialize robot communication: %s", err)
+            self._logger.error(f"Failed to initialize robot communication: {err}")
             return False, str(err)
         except Exception as err:
             self._logger.error(traceback.format_exc())
