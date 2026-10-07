@@ -140,7 +140,7 @@ class SpotLeash(SpotLeashProtocol):
         return [self._lease_task]
 
     def claim(self) -> bool:
-        if self._lease is not None:
+        if self._lease and self._lease_task.proto:
             client_name = self._robot.lease_wallet.client_name
             for resource in self._lease_task.proto:
                 if resource.resource == "all-leases" and client_name in resource.lease_owner.client_name:
